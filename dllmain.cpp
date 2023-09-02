@@ -144,7 +144,7 @@ inline void DumpClassMembers(ClassDescription* classDesc) {
 template<typename... Args>
 void SchemaDumpToMap(const char* _module, Args&&... args) {
 	const char* classes[sizeof...(args)] = { std::forward<Args>(args)... };
-	auto typeScope = SchemaSystem->CallVFunc<13, CSchemaSystemTypeScope*>(_module);
+	auto typeScope = SchemaSystem->CallVFunc<13, CSchemaSystemTypeScope*>(_module, nullptr); // second arg is a buffer for something
 
 	if (!typeScope)
 		return;
