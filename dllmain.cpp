@@ -1,10 +1,12 @@
 #include "pch.h"
 #include <fstream>
-#include <Windows.h>
 #include <iostream>
+
+#include <Windows.h>
+#include <cstdint>
+
 #include <string>
 #include <unordered_map>
-#include <cstdint>
 #include <span>
 #include <format>
 #include <chrono>
@@ -12,42 +14,35 @@
 #include <set>
 #include <assert.h>
 #include <filesystem>
+
 #include "memutils-x64.h"
-#include "sdk.h"
+
 #include <ShlObj_core.h>
-#include <Windows.h>
+#include "schema.h"
 #include <TlHelp32.h>
 
 using namespace memutils;
 
+class ClassDescription;
+
 int scopeCount = 0;
 int scopesDumped = 0;
 
-struct CSchemaClassBinding {
-	CSchemaClassBinding* parent;
-	const char* m_binary_name; // ex: C_World
-	const char* m_module_name; // ex: libclient.so
-	const char* m_class_name; // ex: client
-	void* m_class_info_old_synthesized;
-	void* m_class_info;
-	void* m_this_module_binding_pointer;
-	void* m_schema_type;
-};
-
-struct ClassDescription;
-
 class CSchemaSystemTypeScope : public VClass {
 public:
-	ClassDescription* FindDeclaredClass(const char* class_name) {
-		return CallVFunc<2, ClassDescription*>(class_name);
+	CSchemaClassInfo* FindDeclaredClass(const char* class_name) {
+		CSchemaClassInfo* class_info;
+
+		CallVFunc<2>(&class_info, class_name);
+		return class_info;
 	}
 
 	std::string_view GetScopeName() {
 		return { m_name_.data() };
 	}
-
+		
 	CUtlTSHash<CSchemaClassBinding*> GetClasses() {
-		return Member< CUtlTSHash<CSchemaClassBinding*> >(0x558);
+		return Member< CUtlTSHash<CSchemaClassBinding*> >(0x588);
 	}
 
 	std::array<char, 256> m_name_ = {};
@@ -64,13 +59,7 @@ struct SchemaTypeDescription {
 	const char* name;
 	uintptr_t idk2;
 };
-struct SchemaClassFieldData_t {
-	const char* m_name; // 0x0000
-	SchemaTypeDescription* m_type; // 0x0008
-	std::int32_t m_single_inheritance_offset; // 0x0010
-	std::int32_t m_metadata_size; // 0x0014
-	void* m_metadata; // 0x0018
-};
+
 
 struct ClassDescription {
 	ClassDescription* self;        //0
@@ -120,25 +109,21 @@ public:
 
 CSchemaSystem* SchemaSystem = 0;
 
-inline void DumpClassMembers(ClassDescription* classDesc) {
-	std::string className = classDesc->className;
+inline void DumpClassMembers(CSchemaClassInfo* classDesc) {
+	std::string className = classDesc->m_name;
 
 	if (Netvars.count(className))
 		return;
 
 	std::cout << "Dumping " << className << "...\n";
 
-	for (uintptr_t i = 0; i < classDesc->membersSize; i++) {
-		SchemaClassFieldData_t desc = classDesc->membersDescription[i];
+	for (const auto& desc : classDesc->GetFields()) {
 		Netvars[className].insert(desc);
 		//		std::cout << std::format("{}: {} ({})\n", info.schematypeptr->name, info.name, info.offset);
 	}
 
-	if (classDesc->parentInfo) {
-		classDesc = classDesc->parentInfo->parent;
-		DumpClassMembers(classDesc);
-	}
-
+	if (classDesc->GetBaseClass())
+		DumpClassMembers(*classDesc->GetBaseClass());
 }
 
 template<typename... Args>
@@ -167,29 +152,30 @@ std::string getTimeStr() {
 	std::strftime(&s[0], s.size(), "%d-%m-%Y %H:%M:%S", std::localtime(&now));
 	return s;
 }
-void DumpClassToText(const ClassDescription* classDesc, std::ofstream& fout, std::set<std::string>& parents) {
+void DumpClassToText(const CSchemaClassInfo* classDesc, std::ofstream& fout, std::set<std::string>& parents) {
 	fout << std::hex;
-	auto parentInfo = classDesc->parentInfo;
+
+	auto parentInfo = classDesc->GetBaseClass().value_or(nullptr);
 	while (parentInfo) {
-		if (!parents.contains(parentInfo->parent->className)) {
-			parents.insert(parentInfo->parent->className);
-			DumpClassToText(parentInfo->parent, fout, parents);
+		if (!parents.contains(parentInfo->m_name)) {
+			parents.insert(parentInfo->m_name);
+			DumpClassToText(parentInfo, fout, parents);
 		}
-		parentInfo = parentInfo->parent->parentInfo;
+		parentInfo = parentInfo->GetBaseClass().value_or(nullptr);
 	}
 
-	fout << classDesc->className;
+	fout << classDesc->m_name;
 
-	if (classDesc->parentInfo)
-		fout << " : " << classDesc->parentInfo->parent->className;
+	if (classDesc->GetBaseClass())
+		fout << " : " << (*classDesc->GetBaseClass())->m_name;
 	fout << '\n';
 
-	if (classDesc->membersSize == 0)
+	if (classDesc->m_fields_size == 0)
 		fout << "<no members>\n";
 	else
-		for (uintptr_t i = 0; i < classDesc->membersSize; i++) {
-			SchemaClassFieldData_t field = classDesc->membersDescription[i];
-			fout << std::format("\t{} {} {:#x};\n", field.m_type->name, field.m_name, field.m_single_inheritance_offset);
+		for (uintptr_t i = 0; i < classDesc->m_fields_size; i++) {
+			SchemaClassFieldData_t field = classDesc->m_fields[i];
+			fout << std::format("\t{} {} {:#x};\n", field.m_type->m_name_, field.m_name, field.m_single_inheritance_offset);
 		}
 	fout << '\n';
 }
@@ -211,9 +197,9 @@ void DumpAllClasses(const std::string& dir) {
 		std::filesystem::create_directory(dir + "\\" + scope->GetScopeName().data());
 
 		for (const auto _class : classes.GetElements()) {
-			std::ofstream fout(dir + "\\" + scope->GetScopeName().data() + "\\" + _class->m_binary_name + ".txt");
+			std::ofstream fout(dir + "\\" + scope->GetScopeName().data() + "\\" + _class->m_name + ".txt");
 
-			const auto classDesc = scope->FindDeclaredClass(_class->m_binary_name);
+			const auto classDesc = scope->FindDeclaredClass(_class->m_name);
 			std::set<std::string> parents;
 			DumpClassToText(classDesc, fout, parents);
 
@@ -304,7 +290,7 @@ void SaveNetvarsToFile(std::ofstream& fout) {
 	for (auto& [className, classMap] : Netvars) {
 		fout << std::format("\tnamespace {}", className) << " {\n";
 		for (auto& desc : classMap)
-			fout << std::format("\t\tconstexpr uint32_t {} = {:#x}; // {}\n", desc.m_name, desc.m_single_inheritance_offset, desc.m_type->name);
+			fout << std::format("\t\tconstexpr uint32_t {} = {:#x}; // {}\n", desc.m_name, desc.m_single_inheritance_offset, desc.m_type->m_name_);
 
 		fout << "\t}\n";
 	}
@@ -328,7 +314,7 @@ uintptr_t WINAPI HackThread(HMODULE hModule) {
 		char buf[256];
 		SHGetSpecialFolderPathA(0, buf, CSIDL_PROFILE, false);
 		dumpFolderPath = buf;
-		dumpFolderPath += "\\Documents\\PudgeDumper";
+		dumpFolderPath += "\\Documents\\D2Dumper";
 	}
 	std::cout << "Removing old dump...\n";
 	std::filesystem::remove_all(dumpFolderPath);
