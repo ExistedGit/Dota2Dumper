@@ -152,6 +152,7 @@ std::string getTimeStr() {
 	std::strftime(&s[0], s.size(), "%d-%m-%Y %H:%M:%S", std::localtime(&now));
 	return s;
 }
+
 void DumpClassToText(const CSchemaClassInfo* classDesc, std::ofstream& fout, std::set<std::string>& parents) {
 	fout << std::hex;
 
@@ -164,6 +165,7 @@ void DumpClassToText(const CSchemaClassInfo* classDesc, std::ofstream& fout, std
 		parentInfo = parentInfo->GetBaseClass().value_or(nullptr);
 	}
 
+	fout << "Size: 0x" << std::hex << classDesc->m_size << "\n";
 	fout << classDesc->m_name;
 
 	if (classDesc->GetBaseClass())
