@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <filesystem>
 
 #include "rtti.h"
 #include "sigscan.h"
@@ -32,23 +33,16 @@ void SetConsoleColor(ConColor text = ConColor::White, ConColor background = ConC
 };
 
 void PrintHeader(std::string_view text) {
-	cout << string(text.size(), '=') << endl << text << endl << string(text.size(), '=') << endl;
+	cout << string(text.size() + 4, '=') << endl << string(2, ' ') << text << endl << string(text.size() + 4, '=') << endl;
 }
+
 void ExitWithError(std::string_view text) {
 	cout << "Error: " << text << "!" << endl;
 	exit(0);
 }
 
-int main(int argc, char** argv) {
-	if (argc == 1) {
-		ExitWithError("Path to steamapps/common/dota 2 beta not provided");
-	}
-
-	PrintHeader("VIRTUAL TABLES");
-
-	string d2dir = argv[1];
-
-	ifstream fin(R"(vmt_signatures.json)");
+void GenVMTs(const string& d2dir, const string& vmtSigPath) {
+	ifstream fin(vmtSigPath);
 	if (!fin.good()) ExitWithError("Could not open vmt_signatures.json");
 
 	auto dataIn = nlohmann::json::parse(fin);
@@ -80,8 +74,8 @@ int main(int argc, char** argv) {
 
 					// If it's just a string then it's a simple signature
 					// Otherwise the pattern goes into a field
-					auto& sig = methodData.type() == nlohmann::json::value_t::string 
-						? methodData 
+					auto& sig = methodData.type() == nlohmann::json::value_t::string
+						? methodData
 						: methodData["pattern"];
 
 					auto func = PatternScanInSection(img, ".text", ParseCombo(sig));
@@ -116,6 +110,8 @@ int main(int argc, char** argv) {
 					dataOut[vmtName][method] = idx;
 				}
 			}
+
+			img.Destroy();
 		}
 	}
 	fin.close();
@@ -125,4 +121,82 @@ int main(int argc, char** argv) {
 	ofstream fout("vmt.json");
 	fout << dataOut.dump(4);
 	fout.close();
+}
+
+void CheckSignatures(const string& d2dir, const string& sigPath) {
+	using namespace std::filesystem;
+
+
+	ifstream fin(sigPath);
+	if (!fin.good()) ExitWithError("Could not open signatures.json");
+
+	unordered_map<string, rtti::PEImage> dlls;
+
+	auto data = nlohmann::json::parse(fin);
+
+	for (auto& [sig, sigData] : data.items()) {
+		if (!dlls.contains(sigData["module"])) {
+			string file;
+			for (recursive_directory_iterator i(d2dir + "\\game\\bin\\win64"), end; i != end; ++i)
+				if (!is_directory(i->path()) && i->path().filename() == (string)sigData["module"]) {
+					file = i->path().string();
+					break;
+				}
+
+			if (file.empty()) {
+				for (recursive_directory_iterator i(d2dir + "\\game\\dota\\bin\\win64"), end; i != end; ++i)
+					if (!is_directory(i->path()) && i->path().filename() == (string)sigData["module"]) {
+						file = i->path().string();
+						break;
+					}
+			}
+
+			if (file.empty())
+				continue;
+
+			dlls[sigData["module"]] = rtti::PEImage::FromFile(file);
+		}
+		auto& image = dlls[sigData["module"]];
+		auto text = image.GetSection(".text");
+		auto addr = PatternScanInSection(image, ".text", ParseCombo(sigData["signature"]));
+		if (addr && sigData.contains("steps"))
+			for (auto& step : sigData["steps"].items()) {
+				if (step.value()[0] == 0) {
+					addr = addr + step.value()[1] + 4 + *(int32_t*)(addr + step.value()[1]);
+					if (!image.IsInBounds(addr)) {
+						addr = 0;
+						break;
+					}
+				}
+				else if (step.value()[0] == 1) {
+					addr = addr + step.value()[1];
+				}
+			}
+
+		if (!addr)
+			SetConsoleColor(ConColor::Red);
+
+		cout << sig << ": " << hex << uppercase << addr << endl << nouppercase;
+
+		SetConsoleColor();
+	}
+	for (auto& [dll, img] : dlls) img.Destroy();
+}
+
+int main(int argc, char** argv) {
+	if (argc == 1) {
+		ExitWithError("Path to 'steamapps/common/dota 2 beta' not provided!");
+	}
+
+	SetConsoleColor();
+
+	string d2dir = argv[1];
+	
+	//string d2dir = R"(H:\SteamLibrary\steamapps\common\dota 2 beta)";
+
+	PrintHeader("VIRTUAL TABLES");
+	GenVMTs(d2dir, R"(E:\GitHub Repositories VIP\Dota2Cheat\Data\vmt_signatures.json)");
+
+	PrintHeader("SIGNATURES");
+	CheckSignatures(d2dir, R"(E:\GitHub Repositories VIP\Dota2Cheat\Data\signatures.json)");
 }

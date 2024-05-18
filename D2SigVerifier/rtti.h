@@ -8,7 +8,6 @@ namespace rtti
 {
 	// RAII classes to not worry about allocations
 	class PEImage {
-		PEImage(const PEImage& other) {}
 	public:
 		PIMAGE_NT_HEADERS pNTHeaders;
 		LPVOID lpFileBase;
@@ -18,7 +17,7 @@ namespace rtti
 
 		PEImage() {}
 
-		~PEImage() {
+		void Destroy() {
 			UnmapViewOfFile(lpFileBase);
 			CloseHandle(hFileMapping);
 			CloseHandle(hFile);
@@ -86,9 +85,14 @@ namespace rtti
 			return 0;
 		}
 
-		template<typename T>
+		template<typename T = uintptr_t>
 		T* GetRaw(uintptr_t ptr) const {
 			return (T*)((uintptr_t)lpFileBase + ptr);
+		}
+
+		template<typename T = uintptr_t>
+		bool IsInBounds(T addr) const {
+			return addr >= (uintptr_t)lpFileBase && addr <= (uintptr_t)lpFileBase + pNTHeaders->OptionalHeader.SizeOfImage;
 		}
 	};
 	struct PEImageSection {
@@ -110,7 +114,7 @@ namespace rtti
 	};
 
 	class RTTI {
-		inline static const PEImage* loadedImage;
+		inline static PEImage loadedImage;
 
 		// We need 3 sections in total to parse RTTI:
 		// .rdata: Complete Object Locators and VMTs 
@@ -131,7 +135,7 @@ namespace rtti
 
 		static bool bounded(auto t) {
 			//return IsInBounds((uintptr_t)t - (uintptr_t)lpFileBase + rdataSec->PointerToRawData, rdataBounds);
-			return t >= (void*)((uintptr_t)loadedImage->lpFileBase) && t <= (void*)((uintptr_t)loadedImage->lpFileBase + loadedImage->pNTHeaders->OptionalHeader.SizeOfImage);
+			return t >= (void*)((uintptr_t)loadedImage.lpFileBase) && t <= (void*)((uintptr_t)loadedImage.lpFileBase + loadedImage.pNTHeaders->OptionalHeader.SizeOfImage);
 		}
 
 		using rva_t = uint32_t;
@@ -145,8 +149,8 @@ namespace rtti
 			void CalculateMethodCount() {
 				methodCount = 0;
 				for (auto i = (uintptr_t*)addr; ; i++) {
-					auto addr = loadedImage->ToRVA(*i);
-					if (!loadedImage->IsVA(*i) || !sections[TEXT].IsInSection(addr))
+					auto addr = loadedImage.ToRVA(*i);
+					if (!loadedImage.IsVA(*i) || !sections[TEXT].IsInSection(addr))
 						break;
 
 					methodCount++;
@@ -154,9 +158,9 @@ namespace rtti
 			}
 
 			int32_t GetIndexOfMethod(uintptr_t ptr) const {
-				auto rva = sections[TEXT].Raw2RVA(ptr - (uintptr_t)loadedImage->lpFileBase);
+				auto rva = sections[TEXT].Raw2RVA(ptr - (uintptr_t)loadedImage.lpFileBase);
 				for (auto i = (uintptr_t*)addr; i < (uintptr_t*)addr + methodCount; i++) {
-					if (loadedImage->ToRVA(*i) == rva)
+					if (loadedImage.ToRVA(*i) == rva)
 						return (int32_t)((uintptr_t)i - addr) / 8;
 				}
 				return -1;
@@ -215,7 +219,7 @@ namespace rtti
 					return false;
 
 				// Check for valid type_info
-				type_info* typeInfo = (type_info*)((uintptr_t)loadedImage->lpFileBase + sections[DATA].RVA2Raw(typeDescriptor));
+				type_info* typeInfo = (type_info*)((uintptr_t)loadedImage.lpFileBase + sections[DATA].RVA2Raw(typeDescriptor));
 				return bounded(typeInfo) && typeInfo->isValid();
 			};
 		};
@@ -261,7 +265,7 @@ namespace rtti
 				objectBase;            // 14 Object base offset (base = ptr col - objectBase)
 
 			type_info* GetTypeDescriptor() const {
-				return loadedImage->GetRaw<type_info>(sections[DATA].RVA2Raw(typeDescriptor));
+				return loadedImage.GetRaw<type_info>(sections[DATA].RVA2Raw(typeDescriptor));
 			}
 
 			bool isValid() const {
@@ -275,7 +279,7 @@ namespace rtti
 				{
 					uint64_t colBase = (uintptr_t)this - this->objectBase;
 
-					type_info* typeInfo = loadedImage->GetRaw<type_info>(sections[DATA].RVA2Raw(typeDescriptor));
+					type_info* typeInfo = loadedImage.GetRaw<type_info>(sections[DATA].RVA2Raw(typeDescriptor));
 					if (!bounded(typeInfo) ||
 						!typeInfo->isValid())
 						return false;
@@ -290,20 +294,20 @@ namespace rtti
 		};
 
 		static VMTInfo FindVMT(const PEImage& image, std::string_view name) {
-			loadedImage = &image;
+			loadedImage = image;
 
-			sections[RDATA] = loadedImage->GetSection(".rdata");
-			sections[DATA] = loadedImage->GetSection(".data");
-			sections[TEXT] = loadedImage->GetSection(".text");
+			sections[RDATA] = loadedImage.GetSection(".rdata");
+			sections[DATA] = loadedImage.GetSection(".data");
+			sections[TEXT] = loadedImage.GetSection(".text");
 
-			auto begin = loadedImage->GetRaw<uintptr_t>(sections[RDATA].pSection->PointerToRawData);
+			auto begin = loadedImage.GetRaw<uintptr_t>(sections[RDATA].pSection->PointerToRawData);
 			auto end = (uintptr_t*)((uintptr_t)begin + sections[RDATA].pSection->SizeOfRawData);
 
 			VMTInfo inf;
 			for (auto i = begin; i < end; i++) {
 				auto addr = *i;
-				if (loadedImage->IsVA(addr) && sections[RDATA].IsInSection(loadedImage->ToRVA(addr))) {
-					auto col = loadedImage->GetRaw<_RTTICompleteObjectLocator>(sections[RDATA].RVA2Raw(loadedImage->ToRVA(addr)));
+				if (loadedImage.IsVA(addr) && sections[RDATA].IsInSection(loadedImage.ToRVA(addr))) {
+					auto col = loadedImage.GetRaw<_RTTICompleteObjectLocator>(sections[RDATA].RVA2Raw(loadedImage.ToRVA(addr)));
 
 					if (!col->isValid())
 						continue;
@@ -330,19 +334,19 @@ namespace rtti
 		static std::unordered_map<std::string_view, VMTInfo> _FindVMTs(const PEImage& image) {
 			std::unordered_map<std::string_view, VMTInfo> res;
 
-			loadedImage = &image;
+			loadedImage = image;
 
-			sections[RDATA] = loadedImage->GetSection(".rdata");
-			sections[DATA] = loadedImage->GetSection(".data");
-			sections[TEXT] = loadedImage->GetSection(".text");
+			sections[RDATA] = loadedImage.GetSection(".rdata");
+			sections[DATA] = loadedImage.GetSection(".data");
+			sections[TEXT] = loadedImage.GetSection(".text");
 
-			auto begin = loadedImage->GetRaw<uintptr_t>(sections[RDATA].pSection->PointerToRawData);
+			auto begin = loadedImage.GetRaw<uintptr_t>(sections[RDATA].pSection->PointerToRawData);
 			auto end = (uintptr_t*)((uintptr_t)begin + sections[RDATA].pSection->SizeOfRawData);
 
 			for (auto i = begin; i < end; i++) {
 				auto addr = *i;
-				if (loadedImage->IsVA(addr) && sections[RDATA].IsInSection(loadedImage->ToRVA(addr))) {
-					auto col = loadedImage->GetRaw<_RTTICompleteObjectLocator>(sections[RDATA].RVA2Raw(loadedImage->ToRVA(addr)));
+				if (loadedImage.IsVA(addr) && sections[RDATA].IsInSection(loadedImage.ToRVA(addr))) {
+					auto col = loadedImage.GetRaw<_RTTICompleteObjectLocator>(sections[RDATA].RVA2Raw(loadedImage.ToRVA(addr)));
 
 					if (!col->isValid())
 						continue;
