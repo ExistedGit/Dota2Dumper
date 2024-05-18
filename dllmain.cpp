@@ -20,6 +20,7 @@
 #include <ShlObj_core.h>
 #include "schema.h"
 #include <TlHelp32.h>
+#include <thread>
 
 using namespace memutils;
 
@@ -40,10 +41,10 @@ public:
 	std::string_view GetScopeName() {
 		return { m_name_.data() };
 	}
-		
-	CUtlTSHash<CSchemaClassBinding*> GetClasses() {
-		return Member< CUtlTSHash<CSchemaClassBinding*> >(0x588);
-	}
+
+	//CUtlTSHash<CSchemaClassBinding*> GetClasses() {
+	//	return Member< CUtlTSHash<CSchemaClassBinding*> >(0x588);
+	//}
 
 	std::array<char, 256> m_name_ = {};
 };
@@ -103,7 +104,7 @@ public:
 	}
 
 	CUtlVector<CSchemaSystemTypeScope*> GetTypeScopes() {
-		return Member<CUtlVector<CSchemaSystemTypeScope*>>(0x190);
+		return Member<CUtlVector<CSchemaSystemTypeScope*>>(0x188);
 	}
 };
 
@@ -192,24 +193,24 @@ void DumpAllClasses(const std::string& dir) {
 	auto scopes = SchemaSystem->GetTypeScopes();
 	scopeCount = scopes.m_Size;
 
-	for (auto scope : scopes) {
-		std::thread([&, scope]() {
+	//for (auto scope : scopes) {
+	//	std::thread([&, scope]() {
 
-			auto classes = scope->GetClasses();
-		std::filesystem::create_directory(dir + "\\" + scope->GetScopeName().data());
+	//		auto classes = scope->GetClasses();
+	//		std::filesystem::create_directory(dir + "\\" + scope->GetScopeName().data());
 
-		for (const auto _class : classes.GetElements()) {
-			std::ofstream fout(dir + "\\" + scope->GetScopeName().data() + "\\" + _class->m_name + ".txt");
+	//		for (const auto _class : classes.GetElements()) {
+	//			std::ofstream fout(dir + "\\" + scope->GetScopeName().data() + "\\" + _class->m_name + ".txt");
 
-			const auto classDesc = scope->FindDeclaredClass(_class->m_name);
-			std::set<std::string> parents;
-			DumpClassToText(classDesc, fout, parents);
+	//			const auto classDesc = scope->FindDeclaredClass(_class->m_name);
+	//			std::set<std::string> parents;
+	//			DumpClassToText(classDesc, fout, parents);
 
-			fout.close();
-		}
-		++scopesDumped;
-			}).detach();
-	}
+	//			fout.close();
+	//		}
+	//		++scopesDumped;
+	//		}).detach();
+	//}
 }
 
 void SaveInterfacesToFile(std::ofstream& fout) {
@@ -268,7 +269,7 @@ void SaveGameSystemsToFile(std::ofstream& fout) {
 
 	auto m_pFactory = *Memory::Scan("E8 ? ? ? ? 84 C0 74 D3 48 8D 0D", "client.dll")
 		.GetAbsoluteAddress(1)
-		.Offset(0xE)
+		.Offset(8)
 		.GetAbsoluteAddress<IGameSystemFactory**>(3);
 
 	set<string> names;
@@ -302,7 +303,7 @@ void SaveNetvarsToFile(std::ofstream& fout) {
 }
 
 
-uintptr_t WINAPI HackThread(HMODULE hModule) {
+void HackThread(HMODULE hModule) {
 	const bool console = true;
 
 	FILE* f;
@@ -313,7 +314,7 @@ uintptr_t WINAPI HackThread(HMODULE hModule) {
 
 	std::string dumpFolderPath;
 	{
-		char buf[256];
+		char buf[256]{ 0 };
 		SHGetSpecialFolderPathA(0, buf, CSIDL_PROFILE, false);
 		dumpFolderPath = buf;
 		dumpFolderPath += "\\Documents\\D2Dumper";
@@ -329,7 +330,8 @@ uintptr_t WINAPI HackThread(HMODULE hModule) {
 
 	clock_t timeStart = clock();
 
-	DumpAllClasses(dumpFolderPath);
+	// TODO: paste implementation from source2sdk
+	// DumpAllClasses(dumpFolderPath);
 
 	SchemaDumpToMap("client.dll",
 		"CEntityIdentity",
@@ -350,11 +352,20 @@ uintptr_t WINAPI HackThread(HMODULE hModule) {
 		"GameTime_t",
 		"C_DOTA_Item_EmptyBottle",
 		"C_DOTAGamerulesProxy",
+		"C_DOTAWearableItem",
+		"C_EconItemView",
 		"C_DOTA_Item_Physical"
 	);
 
 	SchemaDumpToMap("server.dll",
 		"CDOTA_Buff");
+
+	SchemaDumpToMap("particles.dll",
+		"CNewParticleEffect",
+		"C_OP_RenderSprites",
+		"CParticleSystemDefinition",
+		"CParticleVecInput"
+	);
 
 	if (std::ofstream fout(dumpFolderPath + "\\Netvars.h"); fout.is_open()) {
 		SaveNetvarsToFile(fout);
@@ -383,27 +394,18 @@ uintptr_t WINAPI HackThread(HMODULE hModule) {
 		if (f) fclose(f);
 		FreeConsole();
 	}
-	FreeLibraryAndExitThread(hModule, 0);
-	return 0;
+	FreeLibrary(hModule);
 }
+
 BOOL APIENTRY DllMain(HMODULE hModule,
 	DWORD  ul_reason_for_call,
 	LPVOID lpReserved
 )
 {
-	switch (ul_reason_for_call)
-	{
-	case DLL_PROCESS_ATTACH: {
+	if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+		std::thread(HackThread, hModule).detach();
+	}
 
-		HANDLE handle = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)HackThread, hModule, 0, 0);
-		if (handle) CloseHandle(handle);
-		break;
-	}
-	case DLL_THREAD_ATTACH:
-	case DLL_THREAD_DETACH:
-	case DLL_PROCESS_DETACH:
-		break;
-	}
 	return TRUE;
 }
 
