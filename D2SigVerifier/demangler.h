@@ -30,19 +30,17 @@ namespace UnDN {
 	const UINT UNDNAME_NO_ECSU = 0x08000;  // Suppress enum/class/struct/union
 	const UINT UNDNAME_NO_IDENT_CHAR_CHECK = 0x10000;  // Suppress check for IsValidIdentChar
 
-	inline void* mallocWrap(UINT size) { return malloc((UINT)size); }
-
 	/*
 	To supply a buffer to use use 'buffer' and 'sizeBuffer', else for a allocated buffer
 	'buffer' = NULL, 'sizeBuffer' = 0, and use the return string.
 	Call Free on the return result when done with the string.
-	Note: CRT documentation error, the Allocator and Free must be supplied regardless if supplied or allocation buffer method desired.
+	Note: CRT documentation error, the Allocator and Free must be supplied regardless of supplied or allocation buffer method desired.
 	*/
 	// https://www.winehq.org/pipermail/wine-patches/2004-January/009183.html
 	extern "C" LPSTR __cdecl __unDName(__out LPSTR buffer, __in LPCSTR name, int sizeBuffer, _Alloc allocator, _Free _free, UINT flags);
 
 	std::string_view Demangle(const char* c) {
-		if (LPSTR s = __unDName(NULL, c, 0, mallocWrap, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY)))
+		if (LPSTR s = __unDName(NULL, c, 0, (_Alloc)malloc, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY | UNDNAME_NO_ECSU)))
 		{
 			//std::string res = s;
 			//free(s);

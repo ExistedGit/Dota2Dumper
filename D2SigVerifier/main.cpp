@@ -57,7 +57,8 @@ void GenVMTs(const string& d2dir, const string& vmtSigPath) {
 		for (auto& [dll, vmts] : dlls.items()) {
 			auto path = d2dir + folder + dll;
 			auto img = rtti::PEImage::FromFile(path);
-			auto vmtMap = rtti::RTTI::_FindVMTs(img);
+			auto rtti = rtti::RTTI(img);
+			auto vmtMap = rtti.FindVMTs();
 
 			SetConsoleColor(ConColor::Yellow);
 			cout << "  " << dll << endl;
@@ -78,7 +79,7 @@ void GenVMTs(const string& d2dir, const string& vmtSigPath) {
 						? methodData
 						: methodData["pattern"];
 
-					auto func = PatternScanInSection(img, ".text", ParseCombo(sig));
+					auto func = PatternScanInSection(*img, ".text", ParseCombo(sig));
 
 					if (!func)
 						SetConsoleColor(ConColor::Red);
@@ -103,15 +104,13 @@ void GenVMTs(const string& d2dir, const string& vmtSigPath) {
 							}
 						}
 
-					auto idx = vmtMap[vmt].GetIndexOfMethod(func);
+					auto idx = vmtMap[vmt].GetIndexOfMethod(rtti, func);
 					SetConsoleColor();
 					cout << idx << endl;
 					SetConsoleColor(ConColor::BrightWhite);
 					dataOut[vmtName][method] = idx;
 				}
 			}
-
-			img.Destroy();
 		}
 	}
 	fin.close();
@@ -130,7 +129,7 @@ void CheckSignatures(const string& d2dir, const string& sigPath) {
 	ifstream fin(sigPath);
 	if (!fin.good()) ExitWithError("Could not open signatures.json");
 
-	unordered_map<string, rtti::PEImage> dlls;
+	unordered_map<string, shared_ptr<rtti::PEImage>> dlls;
 
 	auto data = nlohmann::json::parse(fin);
 
@@ -157,13 +156,13 @@ void CheckSignatures(const string& d2dir, const string& sigPath) {
 			dlls[sigData["module"]] = rtti::PEImage::FromFile(file);
 		}
 		auto& image = dlls[sigData["module"]];
-		auto text = image.GetSection(".text");
-		auto addr = PatternScanInSection(image, ".text", ParseCombo(sigData["signature"]));
+		auto text = image->GetSection(".text");
+		auto addr = PatternScanInSection(*image, ".text", ParseCombo(sigData["signature"]));
 		if (addr && sigData.contains("steps"))
 			for (auto& step : sigData["steps"].items()) {
 				if (step.value()[0] == 0) {
 					addr = addr + step.value()[1] + 4 + *(int32_t*)(addr + step.value()[1]);
-					if (!image.IsInBounds(addr)) {
+					if (!image->IsInBounds(addr)) {
 						addr = 0;
 						break;
 					}
@@ -180,7 +179,6 @@ void CheckSignatures(const string& d2dir, const string& sigPath) {
 
 		SetConsoleColor();
 	}
-	for (auto& [dll, img] : dlls) img.Destroy();
 }
 
 int main(int argc, char** argv) {
@@ -195,8 +193,8 @@ int main(int argc, char** argv) {
 	//string d2dir = R"(H:\SteamLibrary\steamapps\common\dota 2 beta)";
 
 	PrintHeader("VIRTUAL TABLES");
-	GenVMTs(d2dir, R"(E:\GitHub Repositories VIP\Dota2Cheat\Data\vmt_signatures.json)");
+	GenVMTs(d2dir, R"(.\vmt_signatures.json)");
 
 	PrintHeader("SIGNATURES");
-	CheckSignatures(d2dir, R"(E:\GitHub Repositories VIP\Dota2Cheat\Data\signatures.json)");
+	CheckSignatures(d2dir, R"(.\signatures.json)");
 }

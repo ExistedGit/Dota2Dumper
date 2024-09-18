@@ -73,14 +73,14 @@ static uintptr_t PatternScanInSection(const rtti::PEImage& image, std::string_vi
 {
 	using namespace std::literals::string_view_literals;
 
-	const auto begin = (uintptr_t)image.lpFileBase;
+	const auto begin = (uintptr_t)image.data.data();
 
 	uint8_t* scanPos = nullptr, * scanEnd = nullptr;
 	PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(image.pNTHeaders);
 	auto sec = image.GetSection(section);
 	if (!sec) return 0;
 
-	scanPos = (uint8_t*)((uintptr_t)image.lpFileBase + sec->PointerToRawData);
+	scanPos = (uint8_t*)((uintptr_t)image.data.data() + sec->PointerToRawData);
 	scanEnd = scanPos + sec->SizeOfRawData - pattern.size();
 
 	return (uintptr_t)PatternScan(scanPos, scanEnd, pattern);

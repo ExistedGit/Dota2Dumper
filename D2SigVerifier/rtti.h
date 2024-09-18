@@ -2,56 +2,37 @@
 #include "demangler.h"
 #include <unordered_set>
 #include <unordered_map>
+#include <memory>
+
+using std::shared_ptr;
+using std::vector;
 
 // Pasted from IDA's Class Informer
 namespace rtti
 {
 	// RAII classes to not worry about allocations
 	class PEImage {
+		PEImage() {}
 	public:
 		PIMAGE_NT_HEADERS pNTHeaders;
-		LPVOID lpFileBase;
-		HANDLE hFile;
-		HANDLE hFileMapping;
 		PIMAGE_DOS_HEADER pDosHeader;
+		vector<char> data;
 
-		PEImage() {}
+		static shared_ptr<PEImage> FromFile(std::string_view path) {
+			struct SharedConstructible : PEImage {}; // What a hack!
+			auto res = std::make_shared<SharedConstructible>();
 
-		void Destroy() {
-			UnmapViewOfFile(lpFileBase);
-			CloseHandle(hFileMapping);
-			CloseHandle(hFile);
-		}
+			std::ifstream file(path.data(), std::ios::binary | std::ios::ate);
+			std::streamsize size = file.tellg();
+			file.seekg(0, std::ios::beg);
 
-		static PEImage FromFile(std::string_view path) {
-			PEImage res;
-			res.hFile = CreateFileA(path.data(), GENERIC_READ, FILE_SHARE_READ, NULL,
-				OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-
-			if (res.hFile == INVALID_HANDLE_VALUE)
+			res->data = std::vector<char>(size);
+			if (file.read(res->data.data(), size))
 			{
-				printf("Couldn't open file with CreateFile()\n");
-				return res;
+				res->pDosHeader = (PIMAGE_DOS_HEADER)res->data.data();
+				res->pNTHeaders = PIMAGE_NT_HEADERS((uint8_t*)((uintptr_t)res->pDosHeader + res->pDosHeader->e_lfanew));
 			}
 
-			res.hFileMapping = CreateFileMapping(res.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-			if (res.hFileMapping == 0)
-			{
-				CloseHandle(res.hFile);
-				printf("Couldn't open file mapping with CreateFileMapping()\n");
-				return res;
-			}
-
-			res.lpFileBase = MapViewOfFile(res.hFileMapping, FILE_MAP_READ, 0, 0, 0);
-			if (res.lpFileBase == 0)
-			{
-				CloseHandle(res.hFileMapping);
-				CloseHandle(res.hFile);
-				printf("Couldn't map view of file with MapViewOfFile()\n");
-				return res;
-			}
-			res.pDosHeader = (PIMAGE_DOS_HEADER)res.lpFileBase;
-			res.pNTHeaders = PIMAGE_NT_HEADERS((uint8_t*)((uintptr_t)res.pDosHeader + res.pDosHeader->e_lfanew));
 			return res;
 		}
 
@@ -87,12 +68,12 @@ namespace rtti
 
 		template<typename T = uintptr_t>
 		T* GetRaw(uintptr_t ptr) const {
-			return (T*)((uintptr_t)lpFileBase + ptr);
+			return (T*)((uintptr_t)data.data() + ptr);
 		}
 
 		template<typename T = uintptr_t>
 		bool IsInBounds(T addr) const {
-			return addr >= (uintptr_t)lpFileBase && addr <= (uintptr_t)lpFileBase + pNTHeaders->OptionalHeader.SizeOfImage;
+			return addr >= (uintptr_t)data.data() && addr <= (uintptr_t)data.data() + pNTHeaders->OptionalHeader.SizeOfImage;
 		}
 	};
 	struct PEImageSection {
@@ -114,28 +95,17 @@ namespace rtti
 	};
 
 	class RTTI {
-		inline static PEImage loadedImage;
-
+		shared_ptr<PEImage> loadedImage;
 		// We need 3 sections in total to parse RTTI:
 		// .rdata: Complete Object Locators and VMTs 
 		// .data: Type Info
 		// .text: Methods
-		enum Sections {
-			RDATA,
-			DATA,
-			TEXT
-		};
+		struct PESections {
+			PEImageSection rdata, data, text;
+		} sections;
 
-		inline static PEImageSection sections[3];
-
-		template<typename T>
-		static bool IsInBounds(T val, std::pair<T, T> bounds) {
-			return val >= bounds.first && val <= bounds.second;
-		}
-
-		static bool bounded(auto t) {
-			//return IsInBounds((uintptr_t)t - (uintptr_t)lpFileBase + rdataSec->PointerToRawData, rdataBounds);
-			return t >= (void*)((uintptr_t)loadedImage.lpFileBase) && t <= (void*)((uintptr_t)loadedImage.lpFileBase + loadedImage.pNTHeaders->OptionalHeader.SizeOfImage);
+		bool bounded(auto t) const {
+			return t >= (void*)((uintptr_t)loadedImage->data.data()) && t <= (void*)((uintptr_t)loadedImage->data.data() + loadedImage->pNTHeaders->OptionalHeader.SizeOfImage);
 		}
 
 		using rva_t = uint32_t;
@@ -143,24 +113,33 @@ namespace rtti
 	public:
 		struct VMTInfo {
 			uintptr_t addr{};
-			std::string_view name;
+			std::string name;
 			uint32_t methodCount{};
+			
+			VMTInfo() {}
+			VMTInfo(VMTInfo&& o) noexcept : name(std::move(o.name)), addr(o.addr), methodCount(o.addr) {}
+			VMTInfo& operator=(VMTInfo&& o) noexcept {
+				name = move(o.name);
+				addr = o.addr;
+				methodCount = o.addr;
+				return *this;
+			}
 
-			void CalculateMethodCount() {
+			void CalculateMethodCount(const RTTI& rtti) {
 				methodCount = 0;
 				for (auto i = (uintptr_t*)addr; ; i++) {
-					auto addr = loadedImage.ToRVA(*i);
-					if (!loadedImage.IsVA(*i) || !sections[TEXT].IsInSection(addr))
+					auto addr = rtti.loadedImage->ToRVA(*i);
+					if (!rtti.loadedImage->IsVA(*i) || !rtti.sections.text.IsInSection(addr))
 						break;
 
 					methodCount++;
 				}
 			}
 
-			int32_t GetIndexOfMethod(uintptr_t ptr) const {
-				auto rva = sections[TEXT].Raw2RVA(ptr - (uintptr_t)loadedImage.lpFileBase);
+			int32_t GetIndexOfMethod(const RTTI& rtti, uintptr_t ptr) const {
+				auto rva = rtti.sections.text.Raw2RVA(ptr - (uintptr_t)rtti.loadedImage->pDosHeader);
 				for (auto i = (uintptr_t*)addr; i < (uintptr_t*)addr + methodCount; i++) {
-					if (loadedImage.ToRVA(*i) == rva)
+					if (rtti.loadedImage->ToRVA(*i) == rva)
 						return (int32_t)((uintptr_t)i - addr) / 8;
 				}
 				return -1;
@@ -186,7 +165,7 @@ namespace rtti
 
 				using namespace UnDN;
 
-				if (LPSTR s = __unDName(NULL, _M_d_name + 1, 0, mallocWrap, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY)))
+				if (LPSTR s = __unDName(NULL, _M_d_name + 1, 0, (UnDN::_Alloc)malloc, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY | UNDNAME_NO_ECSU)))
 				{
 					free(s);
 					return true;
@@ -213,14 +192,14 @@ namespace rtti
 			PMD pmd;					// 08 Pointer-to-member displacement info
 			UINT attributes;			// 14 Flags
 
-			bool isValid(uintptr_t colBase64 = NULL) const {
+			bool isValid(const RTTI& rtti, uintptr_t colBase64 = NULL) const {
 				// Valid flags are the lower byte only
 				if ((attributes & 0xFFFFFF00) != 0)
 					return false;
 
 				// Check for valid type_info
-				type_info* typeInfo = (type_info*)((uintptr_t)loadedImage.lpFileBase + sections[DATA].RVA2Raw(typeDescriptor));
-				return bounded(typeInfo) && typeInfo->isValid();
+				type_info* typeInfo = (type_info*)((uintptr_t)rtti.loadedImage->pDosHeader + rtti.sections.data.RVA2Raw(typeDescriptor));
+				return rtti.bounded(typeInfo) && typeInfo->isValid();
 			};
 		};
 
@@ -233,7 +212,7 @@ namespace rtti
 			uint32_t numBaseClasses;	// 08 Number of classes in the following 'baseClassArray'
 			rva_t	 baseClassArray;    // 0C *X64 int32 offset to _RTTIBaseClassArray*
 
-			bool isValid(uintptr_t colBase64 = NULL) const {
+			bool isValid(const RTTI& rtti, uintptr_t colBase64 = NULL) const {
 				if (signature != 0)
 					return false;
 
@@ -245,7 +224,7 @@ namespace rtti
 					auto baseClassArray = (uint32_t*)(colBase64 + (UINT64)this->baseClassArray);
 
 					auto baseClassDescriptor = (_RTTIBaseClassDescriptor*)(colBase64 + (UINT64)*baseClassArray);
-					return bounded(baseClassDescriptor) && baseClassDescriptor->isValid(colBase64);
+					return rtti.bounded(baseClassDescriptor) && baseClassDescriptor->isValid(rtti, colBase64);
 				}
 
 				return false;
@@ -264,11 +243,11 @@ namespace rtti
 				classDescriptor,       // 10 (_RTTIClassHierarchyDescriptor *) Describes inheritance hierarchy  *X64 int32 offset
 				objectBase;            // 14 Object base offset (base = ptr col - objectBase)
 
-			type_info* GetTypeDescriptor() const {
-				return loadedImage.GetRaw<type_info>(sections[DATA].RVA2Raw(typeDescriptor));
+			type_info* GetTypeDescriptor(const RTTI& rtti) const {
+				return rtti.loadedImage->GetRaw<type_info>(rtti.sections.data.RVA2Raw(typeDescriptor));
 			}
 
-			bool isValid() const {
+			bool isValid(const RTTI& rtti) const {
 				// Check signature
 				if (signature != 1)
 					return false;
@@ -279,51 +258,53 @@ namespace rtti
 				{
 					uint64_t colBase = (uintptr_t)this - this->objectBase;
 
-					type_info* typeInfo = loadedImage.GetRaw<type_info>(sections[DATA].RVA2Raw(typeDescriptor));
-					if (!bounded(typeInfo) ||
+					type_info* typeInfo = rtti.loadedImage->GetRaw<type_info>(rtti.sections.data.RVA2Raw(typeDescriptor));
+					if (!rtti.bounded(typeInfo) ||
 						!typeInfo->isValid())
 						return false;
 
 					auto classDescriptor =
 						(_RTTIClassHierarchyDescriptor*)(colBase + (uintptr_t)this->classDescriptor);
-					return bounded(classDescriptor) && classDescriptor->isValid(colBase);
+					return rtti.bounded(classDescriptor) && classDescriptor->isValid(rtti, colBase);
 				}
 
 				return false;
 			}
 		};
 
-		static VMTInfo FindVMT(const PEImage& image, std::string_view name) {
-			loadedImage = image;
+		RTTI(const shared_ptr<PEImage>& image) : loadedImage(image) {
+			sections = {
+				loadedImage->GetSection(".rdata"),
+				loadedImage->GetSection(".data"),
+				loadedImage->GetSection(".text")
+			};
+		}
 
-			sections[RDATA] = loadedImage.GetSection(".rdata");
-			sections[DATA] = loadedImage.GetSection(".data");
-			sections[TEXT] = loadedImage.GetSection(".text");
+		VMTInfo FindVMT(const PEImage& image, std::string_view name) {
 
-			auto begin = loadedImage.GetRaw<uintptr_t>(sections[RDATA].pSection->PointerToRawData);
-			auto end = (uintptr_t*)((uintptr_t)begin + sections[RDATA].pSection->SizeOfRawData);
+			auto begin = loadedImage->GetRaw<uintptr_t>(sections.rdata.pSection->PointerToRawData);
+			auto end = (uintptr_t*)((uintptr_t)begin + sections.rdata.pSection->SizeOfRawData);
 
 			VMTInfo inf;
 			for (auto i = begin; i < end; i++) {
 				auto addr = *i;
-				if (loadedImage.IsVA(addr) && sections[RDATA].IsInSection(loadedImage.ToRVA(addr))) {
-					auto col = loadedImage.GetRaw<_RTTICompleteObjectLocator>(sections[RDATA].RVA2Raw(loadedImage.ToRVA(addr)));
+				if (loadedImage->IsVA(addr) && sections.rdata.IsInSection(loadedImage->ToRVA(addr))) {
+					auto col = loadedImage->GetRaw<_RTTICompleteObjectLocator>(sections.rdata.RVA2Raw(loadedImage->ToRVA(addr)));
 
-					if (!col->isValid())
+					if (!col->isValid(*this))
 						continue;
 
-					auto vmtName = col->GetTypeDescriptor()->GetDemangledName();
-					auto prefixless = vmtName.substr(vmtName.find(' ') + 1);
+					auto vmtName = col->GetTypeDescriptor(*this)->GetDemangledName();
 					inf.addr = (uintptr_t)(i + 1);
-					inf.name = prefixless;
-					inf.CalculateMethodCount();
+					inf.name = vmtName;
+					inf.CalculateMethodCount(*this);
 
 					i += inf.methodCount;
 
-					if (prefixless != name) {
-						free((void*)vmtName.data());
-						continue;
-					}
+					//if (vmtName != name) {
+					//	free((void*)vmtName.data());
+					//	continue;
+					//}
 
 					return inf;
 				}
@@ -331,36 +312,30 @@ namespace rtti
 			return {};
 		}
 
-		static std::unordered_map<std::string_view, VMTInfo> _FindVMTs(const PEImage& image) {
+		std::unordered_map<std::string_view, VMTInfo> FindVMTs() {
 			std::unordered_map<std::string_view, VMTInfo> res;
 
-			loadedImage = image;
-
-			sections[RDATA] = loadedImage.GetSection(".rdata");
-			sections[DATA] = loadedImage.GetSection(".data");
-			sections[TEXT] = loadedImage.GetSection(".text");
-
-			auto begin = loadedImage.GetRaw<uintptr_t>(sections[RDATA].pSection->PointerToRawData);
-			auto end = (uintptr_t*)((uintptr_t)begin + sections[RDATA].pSection->SizeOfRawData);
+			auto begin = loadedImage->GetRaw<uintptr_t>(sections.rdata.pSection->PointerToRawData);
+			auto end = (uintptr_t*)((uintptr_t)begin + sections.rdata.pSection->SizeOfRawData);
 
 			for (auto i = begin; i < end; i++) {
 				auto addr = *i;
-				if (loadedImage.IsVA(addr) && sections[RDATA].IsInSection(loadedImage.ToRVA(addr))) {
-					auto col = loadedImage.GetRaw<_RTTICompleteObjectLocator>(sections[RDATA].RVA2Raw(loadedImage.ToRVA(addr)));
+				if (loadedImage->IsVA(addr) && sections.rdata.IsInSection(loadedImage->ToRVA(addr))) {
+					auto col = loadedImage->GetRaw<_RTTICompleteObjectLocator>(sections.rdata.RVA2Raw(loadedImage->ToRVA(addr)));
 
-					if (!col->isValid())
+					if (!col->isValid(*this))
 						continue;
 
 					VMTInfo inf;
 
-					auto name = col->GetTypeDescriptor()->GetDemangledName();
+					auto name = col->GetTypeDescriptor(*this)->GetDemangledName();
 					name = name.substr(name.find(' ') + 1);
 					inf.addr = (uintptr_t)(i + 1);
 					inf.name = name;
-					inf.CalculateMethodCount();
+					inf.CalculateMethodCount(*this);
 
 					if (!col->offset)
-						res[name] = inf;
+						res[name] = std::move(inf);
 
 					i += inf.methodCount;
 				}
