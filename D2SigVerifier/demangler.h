@@ -39,13 +39,7 @@ namespace UnDN {
 	// https://www.winehq.org/pipermail/wine-patches/2004-January/009183.html
 	extern "C" LPSTR __cdecl __unDName(__out LPSTR buffer, __in LPCSTR name, int sizeBuffer, _Alloc allocator, _Free _free, UINT flags);
 
-	std::string_view Demangle(const char* c) {
-		if (LPSTR s = __unDName(NULL, c, 0, (_Alloc)malloc, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY | UNDNAME_NO_ECSU)))
-		{
-			//std::string res = s;
-			//free(s);
-			return s;
-		}
-		return "";
+	char* Demangle(const char* c) {
+		return  __unDName(NULL, c, 0, (_Alloc)malloc, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY | UNDNAME_NO_ECSU));
 	}
 }

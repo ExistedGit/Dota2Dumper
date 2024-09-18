@@ -90,7 +90,7 @@ namespace rtti
 		}
 
 		bool IsInSection(DWORD rva) const {
-			return rva >= pSection->VirtualAddress && rva <= pSection->VirtualAddress + pSection->Misc.VirtualSize;
+			return rva >= pSection->VirtualAddress && rva < pSection->VirtualAddress + pSection->Misc.VirtualSize;
 		}
 	};
 
@@ -104,103 +104,30 @@ namespace rtti
 			PEImageSection rdata, data, text;
 		} sections;
 
-		bool bounded(auto t) const {
+		bool IsValidAddress(auto t) const {
 			return t >= (void*)((uintptr_t)loadedImage->data.data()) && t <= (void*)((uintptr_t)loadedImage->data.data() + loadedImage->pNTHeaders->OptionalHeader.SizeOfImage);
 		}
 
 		using rva_t = uint32_t;
-
-	public:
-		struct VMTInfo {
-			uintptr_t addr{};
-			std::string name;
-			uint32_t methodCount{};
-			
-			VMTInfo() {}
-			VMTInfo(VMTInfo&& o) noexcept : name(std::move(o.name)), addr(o.addr), methodCount(o.addr) {}
-			VMTInfo& operator=(VMTInfo&& o) noexcept {
-				name = move(o.name);
-				addr = o.addr;
-				methodCount = o.addr;
-				return *this;
-			}
-
-			void CalculateMethodCount(const RTTI& rtti) {
-				methodCount = 0;
-				for (auto i = (uintptr_t*)addr; ; i++) {
-					auto addr = rtti.loadedImage->ToRVA(*i);
-					if (!rtti.loadedImage->IsVA(*i) || !rtti.sections.text.IsInSection(addr))
-						break;
-
-					methodCount++;
-				}
-			}
-
-			int32_t GetIndexOfMethod(const RTTI& rtti, uintptr_t ptr) const {
-				auto rva = rtti.sections.text.Raw2RVA(ptr - (uintptr_t)rtti.loadedImage->pDosHeader);
-				for (auto i = (uintptr_t*)addr; i < (uintptr_t*)addr + methodCount; i++) {
-					if (rtti.loadedImage->ToRVA(*i) == rva)
-						return (int32_t)((uintptr_t)i - addr) / 8;
-				}
-				return -1;
-			}
-		};
-
 
 		struct type_info
 		{
 			uintptr_t vfptr;	       // type_info class vftable
 			uintptr_t _M_data;      // NULL until loaded at runtime
 			char _M_d_name[32]; // Mangled name (prefix: .?AV=classes, .?AU=structs)
-
-			std::string_view GetDemangledName() const {
-				return UnDN::Demangle(_M_d_name + 1);
-			}
-
-			bool isNameValid() const
-			{
-				// Should start with a period
-				if (_M_d_name[0] != '.')
-					return false;
-
-				using namespace UnDN;
-
-				if (LPSTR s = __unDName(NULL, _M_d_name + 1, 0, (UnDN::_Alloc)malloc, free, (UNDNAME_32_BIT_DECODE | UNDNAME_TYPE_ONLY | UNDNAME_NO_ECSU)))
-				{
-					free(s);
-					return true;
-				}
-
-				return false;
-			}
-
-			bool isValid() const {
-				return vfptr && _M_data == 0 && isNameValid();
-			};
-		};
-		struct PMD
-		{
-			int mdisp;	// 00 Member displacement
-			int pdisp;  // 04 Vftable displacement
-			int vdisp;  // 08 Displacement inside vftable
 		};
 
 		struct _RTTIBaseClassDescriptor
 		{
 			UINT typeDescriptor;        // 00 Type descriptor of the class  *X64 int32 offset
 			UINT numContainedBases;		// 04 Number of nested classes following in the Base Class Array
-			PMD pmd;					// 08 Pointer-to-member displacement info
+			struct PMD
+			{
+				int mdisp;	// 00 Member displacement
+				int pdisp;  // 04 Vftable displacement
+				int vdisp;  // 08 Displacement inside vftable
+			} pmd;					// 08 Pointer-to-member displacement info
 			UINT attributes;			// 14 Flags
-
-			bool isValid(const RTTI& rtti, uintptr_t colBase64 = NULL) const {
-				// Valid flags are the lower byte only
-				if ((attributes & 0xFFFFFF00) != 0)
-					return false;
-
-				// Check for valid type_info
-				type_info* typeInfo = (type_info*)((uintptr_t)rtti.loadedImage->pDosHeader + rtti.sections.data.RVA2Raw(typeDescriptor));
-				return rtti.bounded(typeInfo) && typeInfo->isValid();
-			};
 		};
 
 		struct _RTTIClassHierarchyDescriptor
@@ -211,24 +138,6 @@ namespace rtti
 			uint32_t attributes;		// 04 Flags
 			uint32_t numBaseClasses;	// 08 Number of classes in the following 'baseClassArray'
 			rva_t	 baseClassArray;    // 0C *X64 int32 offset to _RTTIBaseClassArray*
-
-			bool isValid(const RTTI& rtti, uintptr_t colBase64 = NULL) const {
-				if (signature != 0)
-					return false;
-
-				if ((attributes & 0xFFFFFFF0) != 0)
-					return false;
-
-				if (numBaseClasses >= 1)
-				{
-					auto baseClassArray = (uint32_t*)(colBase64 + (UINT64)this->baseClassArray);
-
-					auto baseClassDescriptor = (_RTTIBaseClassDescriptor*)(colBase64 + (UINT64)*baseClassArray);
-					return rtti.bounded(baseClassDescriptor) && baseClassDescriptor->isValid(rtti, colBase64);
-				}
-
-				return false;
-			};
 		};
 
 		struct _RTTICompleteObjectLocator
@@ -242,36 +151,9 @@ namespace rtti
 			rva_t typeDescriptor,	    // 0C (type_info *) of the complete class  *X64 int32 offset
 				classDescriptor,       // 10 (_RTTIClassHierarchyDescriptor *) Describes inheritance hierarchy  *X64 int32 offset
 				objectBase;            // 14 Object base offset (base = ptr col - objectBase)
-
-			type_info* GetTypeDescriptor(const RTTI& rtti) const {
-				return rtti.loadedImage->GetRaw<type_info>(rtti.sections.data.RVA2Raw(typeDescriptor));
-			}
-
-			bool isValid(const RTTI& rtti) const {
-				// Check signature
-				if (signature != 1)
-					return false;
-
-				if (objectBase != 0 &&
-					typeDescriptor != 0 &&
-					classDescriptor != 0)
-				{
-					uint64_t colBase = (uintptr_t)this - this->objectBase;
-
-					type_info* typeInfo = rtti.loadedImage->GetRaw<type_info>(rtti.sections.data.RVA2Raw(typeDescriptor));
-					if (!rtti.bounded(typeInfo) ||
-						!typeInfo->isValid())
-						return false;
-
-					auto classDescriptor =
-						(_RTTIClassHierarchyDescriptor*)(colBase + (uintptr_t)this->classDescriptor);
-					return rtti.bounded(classDescriptor) && classDescriptor->isValid(rtti, colBase);
-				}
-
-				return false;
-			}
 		};
 
+	public:
 		RTTI(const shared_ptr<PEImage>& image) : loadedImage(image) {
 			sections = {
 				loadedImage->GetSection(".rdata"),
@@ -280,36 +162,104 @@ namespace rtti
 			};
 		}
 
-		VMTInfo FindVMT(const PEImage& image, std::string_view name) {
+		struct VMTInfo {
+			uintptr_t addr{};
+			std::string_view name;
+			uint32_t methodCount{};
 
-			auto begin = loadedImage->GetRaw<uintptr_t>(sections.rdata.pSection->PointerToRawData);
-			auto end = (uintptr_t*)((uintptr_t)begin + sections.rdata.pSection->SizeOfRawData);
+			//VMTInfo() {}
+			//VMTInfo(VMTInfo&& o) noexcept : name(std::move(o.name)), addr(o.addr), methodCount(o.methodCount) {}
+			//VMTInfo& operator=(VMTInfo&& o) noexcept {
+			//	name = move(o.name);
+			//	addr = o.addr;
+			//	methodCount = o.methodCount;
+			//	return *this;
+			//}
+		};
 
-			VMTInfo inf;
-			for (auto i = begin; i < end; i++) {
-				auto addr = *i;
-				if (loadedImage->IsVA(addr) && sections.rdata.IsInSection(loadedImage->ToRVA(addr))) {
-					auto col = loadedImage->GetRaw<_RTTICompleteObjectLocator>(sections.rdata.RVA2Raw(loadedImage->ToRVA(addr)));
+		void CalculateMethodCount(VMTInfo& vmt) {
+			vmt.methodCount = 0;
+			for (auto i = (uintptr_t*)vmt.addr; ; i++) {
+				auto addr = loadedImage->ToRVA(*i);
+				if (!loadedImage->IsVA(*i) || !sections.text.IsInSection(addr))
+					break;
 
-					if (!col->isValid(*this))
-						continue;
-
-					auto vmtName = col->GetTypeDescriptor(*this)->GetDemangledName();
-					inf.addr = (uintptr_t)(i + 1);
-					inf.name = vmtName;
-					inf.CalculateMethodCount(*this);
-
-					i += inf.methodCount;
-
-					//if (vmtName != name) {
-					//	free((void*)vmtName.data());
-					//	continue;
-					//}
-
-					return inf;
-				}
+				vmt.methodCount++;
 			}
-			return {};
+		}
+
+		int32_t GetIndexOfMethod(const VMTInfo& vmt, uintptr_t ptr) const {
+			auto rva = sections.text.Raw2RVA(ptr - (uintptr_t)loadedImage->pDosHeader);
+			for (auto i = (uintptr_t*)vmt.addr; i < (uintptr_t*)vmt.addr + vmt.methodCount; i++) {
+				if (loadedImage->ToRVA(*i) == rva)
+					return (int32_t)((uintptr_t)i - vmt.addr) / 8;
+			}
+			return -1;
+		}
+
+		// Testing typeinfo's validity involves checking its demangled name, so we
+		// save time and resources on that by directly obtaining the name
+		const char* GetTypeInfoClassName(type_info* ti) {
+			if (!ti->vfptr) return nullptr;
+
+			if (ti->_M_d_name[0] != '.') return nullptr;
+
+			return UnDN::Demangle(ti->_M_d_name + 1);
+		}
+
+		bool IsValid(const _RTTIBaseClassDescriptor* bc, uintptr_t colBase64 = NULL) const {
+			// Valid flags are the lower byte only
+			if ((bc->attributes & 0xFFFFFF00) != 0)
+				return false;
+
+			// Check for valid type_info
+			type_info* typeInfo = (type_info*)((uintptr_t)loadedImage->pDosHeader + sections.data.RVA2Raw(bc->typeDescriptor));
+			return IsValidAddress(typeInfo);
+		};
+
+		bool IsValid(const _RTTIClassHierarchyDescriptor* ch, uintptr_t colBase64 = NULL) const {
+			if (ch->signature != 0)
+				return false;
+
+			if ((ch->attributes & 0xFFFFFFF0) != 0)
+				return false;
+
+			if (ch->numBaseClasses < 1)
+				return false;
+
+			auto baseClassArray = (uint32_t*)(colBase64 + (UINT64)ch->baseClassArray);
+
+			auto baseClassDescriptor = (_RTTIBaseClassDescriptor*)(colBase64 + (UINT64)*baseClassArray);
+			return IsValidAddress(baseClassDescriptor) && IsValid(baseClassDescriptor, colBase64);
+
+
+			return false;
+		};
+
+		bool IsValid(const _RTTICompleteObjectLocator* col) const {
+			if (col->signature != 1)
+				return false;
+
+			if (col->objectBase != 0 &&
+				col->typeDescriptor != 0 &&
+				col->classDescriptor != 0)
+			{
+				uint64_t colBase = (uintptr_t)col - col->objectBase;
+
+				type_info* typeInfo = loadedImage->GetRaw<type_info>(sections.data.RVA2Raw(col->typeDescriptor));
+				if (!IsValidAddress(typeInfo))
+					return false;
+
+				auto classDescriptor =
+					(_RTTIClassHierarchyDescriptor*)(colBase + (uintptr_t)col->classDescriptor);
+				return IsValidAddress(classDescriptor) && IsValid(classDescriptor, colBase);
+			}
+
+			return false;
+		}
+
+		type_info* GetTypeDescriptor(const _RTTICompleteObjectLocator* col) const {
+			return loadedImage->GetRaw<type_info>(sections.data.RVA2Raw(col->typeDescriptor));
 		}
 
 		std::unordered_map<std::string_view, VMTInfo> FindVMTs() {
@@ -323,19 +273,25 @@ namespace rtti
 				if (loadedImage->IsVA(addr) && sections.rdata.IsInSection(loadedImage->ToRVA(addr))) {
 					auto col = loadedImage->GetRaw<_RTTICompleteObjectLocator>(sections.rdata.RVA2Raw(loadedImage->ToRVA(addr)));
 
-					if (!col->isValid(*this))
+					if (!IsValid(col))
 						continue;
+
+					type_info* typeInfo = loadedImage->GetRaw<type_info>(sections.data.RVA2Raw(col->typeDescriptor));
 
 					VMTInfo inf;
 
-					auto name = col->GetTypeDescriptor(*this)->GetDemangledName();
-					name = name.substr(name.find(' ') + 1);
+					auto name = GetTypeInfoClassName(typeInfo);
+					if (!name) 
+						continue;
+
 					inf.addr = (uintptr_t)(i + 1);
 					inf.name = name;
-					inf.CalculateMethodCount(*this);
+					
+					CalculateMethodCount(inf);
 
-					if (!col->offset)
-						res[name] = std::move(inf);
+					if (!col->offset) {
+						res[name] = inf;
+					}
 
 					i += inf.methodCount;
 				}

@@ -104,7 +104,7 @@ void GenVMTs(const string& d2dir, const string& vmtSigPath) {
 							}
 						}
 
-					auto idx = vmtMap[vmt].GetIndexOfMethod(rtti, func);
+					auto idx = rtti.GetIndexOfMethod(vmtMap[vmt], func);
 					SetConsoleColor();
 					cout << idx << endl;
 					SetConsoleColor(ConColor::BrightWhite);
