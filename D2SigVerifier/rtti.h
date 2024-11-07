@@ -16,7 +16,7 @@ namespace rtti
 	public:
 		PIMAGE_NT_HEADERS pNTHeaders;
 		PIMAGE_DOS_HEADER pDosHeader;
-		vector<char> data;
+		std::vector<char> data;
 
 		static shared_ptr<PEImage> FromFile(std::string_view path) {
 			struct SharedConstructible : PEImage {}; // What a hack!
@@ -43,27 +43,13 @@ namespace rtti
 			return addr > pNTHeaders->OptionalHeader.ImageBase && addr < pNTHeaders->OptionalHeader.ImageBase + pNTHeaders->OptionalHeader.SizeOfImage;
 		}
 
-		DWORD RvaToRawAddress(DWORD rva)  const {
-			PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNTHeaders);
-			for (int i = 0; i < pNTHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
-				DWORD sectionVA = pSectionHeader->VirtualAddress;
-				DWORD sectionSize = pSectionHeader->Misc.VirtualSize;
-				if (rva >= sectionVA && rva < sectionVA + sectionSize)
-					return (rva - sectionVA) + pSectionHeader->PointerToRawData;
-			}
-			return 0;
-		}
-
 		PIMAGE_SECTION_HEADER GetSection(std::string_view name) const {
 			PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNTHeaders);
-			for (int i = 0; i < pNTHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
-				if ((char*)pSectionHeader->Name == name) {
-					DWORD sectionVA = pSectionHeader->VirtualAddress;
-					DWORD sectionSize = pSectionHeader->Misc.VirtualSize;
+			for (int i = 0; i < pNTHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader)
+				if ((char*)pSectionHeader->Name == name)
 					return pSectionHeader;
-				}
-			}
-			return 0;
+
+			return nullptr;
 		}
 
 		template<typename T = uintptr_t>
@@ -76,6 +62,7 @@ namespace rtti
 			return addr >= (uintptr_t)data.data() && addr <= (uintptr_t)data.data() + pNTHeaders->OptionalHeader.SizeOfImage;
 		}
 	};
+
 	struct PEImageSection {
 		PIMAGE_SECTION_HEADER pSection;
 		PEImageSection(PIMAGE_SECTION_HEADER image) : pSection(image) {}
@@ -192,7 +179,7 @@ namespace rtti
 			auto rva = sections.text.Raw2RVA(ptr - (uintptr_t)loadedImage->pDosHeader);
 			for (auto i = (uintptr_t*)vmt.addr; i < (uintptr_t*)vmt.addr + vmt.methodCount; i++) {
 				if (loadedImage->ToRVA(*i) == rva)
-					return (int32_t)((uintptr_t)i - vmt.addr) / 8;
+					return (int32_t)((uintptr_t)i - vmt.addr) / sizeof(void*);
 			}
 			return -1;
 		}
@@ -240,22 +227,22 @@ namespace rtti
 			if (col->signature != 1)
 				return false;
 
-			if (col->objectBase != 0 &&
-				col->typeDescriptor != 0 &&
-				col->classDescriptor != 0)
-			{
-				uint64_t colBase = (uintptr_t)col - col->objectBase;
+			if (
+				col->objectBase == 0
+				|| col->typeDescriptor == 0
+				|| col->classDescriptor == 0
+				)
+				return false;
 
-				type_info* typeInfo = loadedImage->GetRaw<type_info>(sections.data.RVA2Raw(col->typeDescriptor));
-				if (!IsValidAddress(typeInfo))
-					return false;
+			uint64_t colBase = (uintptr_t)col - col->objectBase;
 
-				auto classDescriptor =
-					(_RTTIClassHierarchyDescriptor*)(colBase + (uintptr_t)col->classDescriptor);
-				return IsValidAddress(classDescriptor) && IsValid(classDescriptor, colBase);
-			}
+			type_info* typeInfo = loadedImage->GetRaw<type_info>(sections.data.RVA2Raw(col->typeDescriptor));
+			if (!IsValidAddress(typeInfo))
+				return false;
 
-			return false;
+			auto classDescriptor =
+				(_RTTIClassHierarchyDescriptor*)(colBase + (uintptr_t)col->classDescriptor);
+			return IsValidAddress(classDescriptor) && IsValid(classDescriptor, colBase);
 		}
 
 		type_info* GetTypeDescriptor(const _RTTICompleteObjectLocator* col) const {
@@ -281,12 +268,12 @@ namespace rtti
 					VMTInfo inf;
 
 					auto name = GetTypeInfoClassName(typeInfo);
-					if (!name) 
+					if (!name)
 						continue;
 
 					inf.addr = (uintptr_t)(i + 1);
 					inf.name = name;
-					
+
 					CalculateMethodCount(inf);
 
 					if (!col->offset) {

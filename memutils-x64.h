@@ -317,4 +317,10 @@ namespace memutils {
 		}
 	};
 
-} // namespace memutils
+}
+
+inline uintptr_t CreateInterface(const char* szModule, const char* szInterface) {
+	typedef void* (*oCreateInterface)(const char*, int);
+	static auto pCreateInterface = (oCreateInterface)GetProcAddress(GetModuleHandleA(szModule), "CreateInterface");
+	return (uintptr_t)pCreateInterface(szInterface, 0);
+}

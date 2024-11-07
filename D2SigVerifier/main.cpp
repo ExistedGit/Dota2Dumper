@@ -122,7 +122,15 @@ void GenVMTs(const string& d2dir, const string& vmtSigPath) {
 	fout.close();
 }
 
-void CheckSignatures(const string& d2dir, const string& sigPath) {
+struct VPInfo {
+	int response, lastError;
+	uintptr_t retaddr, unk;
+	int idk = 0;
+	uintptr_t lpAddress, dwSize;
+	uint32_t newProtect, oldProtect;
+};
+
+static void CheckSignatures(const string& d2dir, const string& sigPath) {
 	using namespace std::filesystem;
 
 
@@ -133,68 +141,75 @@ void CheckSignatures(const string& d2dir, const string& sigPath) {
 
 	auto data = nlohmann::json::parse(fin);
 
-	for (auto& [sig, sigData] : data.items()) {
-		if (!dlls.contains(sigData["module"])) {
-			string file;
-			for (recursive_directory_iterator i(d2dir + "\\game\\bin\\win64"), end; i != end; ++i)
-				if (!is_directory(i->path()) && i->path().filename() == (string)sigData["module"]) {
-					file = i->path().string();
-					break;
-				}
-
-			if (file.empty()) {
-				for (recursive_directory_iterator i(d2dir + "\\game\\dota\\bin\\win64"), end; i != end; ++i)
-					if (!is_directory(i->path()) && i->path().filename() == (string)sigData["module"]) {
+	for (auto& [module_, signatures] : data.items()) {
+		for (auto& [sig, sigData] : signatures.items()) {
+			if (!dlls.contains(module_)) {
+				string file;
+				for (recursive_directory_iterator i(d2dir + "\\game\\bin\\win64"), end; i != end; ++i)
+					if (!is_directory(i->path()) && i->path().filename() == (string)module_) {
 						file = i->path().string();
 						break;
 					}
+
+				if (file.empty()) {
+					for (recursive_directory_iterator i(d2dir + "\\game\\dota\\bin\\win64"), end; i != end; ++i)
+						if (!is_directory(i->path()) && i->path().filename() == (string)module_) {
+							file = i->path().string();
+							break;
+						}
+				}
+
+				if (file.empty())
+					continue;
+
+				dlls[module_] = rtti::PEImage::FromFile(file);
 			}
 
-			if (file.empty())
-				continue;
+			string signature;
+			if (sigData.is_object()) {
+				signature = sigData["signature"];
+			}
+			else signature = sigData;
 
-			dlls[sigData["module"]] = rtti::PEImage::FromFile(file);
-		}
-		auto& image = dlls[sigData["module"]];
-		auto text = image->GetSection(".text");
-		auto addr = PatternScanInSection(*image, ".text", ParseCombo(sigData["signature"]));
-		if (addr && sigData.contains("steps"))
-			for (auto& step : sigData["steps"].items()) {
-				if (step.value()[0] == 0) {
-					addr = addr + step.value()[1] + 4 + *(int32_t*)(addr + step.value()[1]);
-					if (!image->IsInBounds(addr)) {
-						addr = 0;
-						break;
+			auto& image = dlls[module_];
+			auto text = image->GetSection(".text");
+			auto addr = PatternScanInSection(*image, ".text", ParseCombo(signature));
+			if (addr && sigData.is_object() && sigData.contains("steps"))
+				for (auto& step : sigData["steps"].items()) {
+					if (step.value()[0] == 0) {
+						addr = addr + step.value()[1] + 4 + *(int32_t*)(addr + step.value()[1]);
+						if (!image->IsInBounds(addr)) {
+							addr = 0;
+							break;
+						}
+					}
+					else if (step.value()[0] == 1) {
+						addr = addr + step.value()[1];
 					}
 				}
-				else if (step.value()[0] == 1) {
-					addr = addr + step.value()[1];
-				}
-			}
 
-		if (!addr)
-			SetConsoleColor(ConColor::Red);
+			if (!addr)
+				SetConsoleColor(ConColor::Red);
 
-		cout << sig << ": " << hex << uppercase << addr << endl << nouppercase;
+			std::cout << sig << ": " << hex << uppercase << addr << endl << nouppercase;
 
-		SetConsoleColor();
+			SetConsoleColor();
+		}
 	}
 }
 
 int main(int argc, char** argv) {
-	if (argc == 1) {
-		ExitWithError("Path to 'steamapps/common/dota 2 beta' not provided!");
-	}
+	//if (argc == 1) {
+	//	ExitWithError("Path to 'steamapps/common/dota 2 beta' not provided!");
+	//}
+	//string d2dir = argv[1];
 
 	SetConsoleColor();
 
-	string d2dir = argv[1];
-	
-	//string d2dir = R"(H:\SteamLibrary\steamapps\common\dota 2 beta)";
+	string d2dir = R"(H:\SteamLibrary\steamapps\common\dota 2 beta)";
 
 	PrintHeader("VIRTUAL TABLES");
-	GenVMTs(d2dir, R"(.\vmt_signatures.json)");
-
+	GenVMTs(d2dir, R"(E:\GitHub Repositories VIP\Dota2Cheat\Data\vmt_signatures.json)");
 	PrintHeader("SIGNATURES");
-	CheckSignatures(d2dir, R"(.\signatures.json)");
+	CheckSignatures(d2dir, R"(E:\GitHub Repositories VIP\Dota2Cheat\Data\signatures.json)");
 }

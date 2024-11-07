@@ -19,12 +19,25 @@
 
 #include <ShlObj_core.h>
 #include "schema.h"
+#include "sdk.h"
 #include <TlHelp32.h>
 #include <thread>
 
 using namespace memutils;
 
-class ClassDescription;
+using std::endl;
+using std::cout;
+
+std::string getTimeStr() {
+	std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+
+	char buf[50] = { 0 };
+	std::strftime(buf, 50, "%d-%m-%Y %H:%M:%S", std::localtime(&now));
+	return buf;
+}
+
+
+struct ClassDescription;
 
 int scopeCount = 0;
 int scopesDumped = 0;
@@ -42,9 +55,9 @@ public:
 		return { m_name_.data() };
 	}
 
-	//CUtlTSHash<CSchemaClassBinding*> GetClasses() {
-	//	return Member< CUtlTSHash<CSchemaClassBinding*> >(0x588);
-	//}
+	CUtlTSHashV2<CSchemaClassBinding*> GetClasses() {
+		return Member<CUtlTSHashV2<CSchemaClassBinding*>>(1280);
+	}
 
 	std::array<char, 256> m_name_ = {};
 };
@@ -84,14 +97,56 @@ struct less_than_key
 	}
 };
 
-std::unordered_map<std::string, std::set<SchemaClassFieldData_t, less_than_key>> Netvars;
 
-typedef void* (*oCreateInterface)(const char*, int);
-oCreateInterface pCreateInterface;
-uintptr_t CreateInterface(const char* szModule, const char* szInterface) {
-	pCreateInterface = (oCreateInterface)GetProcAddress(GetModuleHandleA(szModule), "CreateInterface");
-	return (uintptr_t)pCreateInterface(szInterface, 0);
-}
+struct SchemaClass {
+	SchemaClass* parent{};
+	std::string name;
+	std::string dll;
+
+	std::set<SchemaClassFieldData_t, less_than_key> fields;
+
+	void DumpToStream(std::ostream& out, std::set<SchemaClass*>& alreadyDumped) {
+		if (alreadyDumped.contains(this)) return;
+
+		alreadyDumped.insert(this);
+
+		if (parent) parent->DumpToStream(out, alreadyDumped);
+
+		// Module, then inheritance chain
+
+		out << "\t// " << dll << std::endl;
+
+		out << "\t// " << name;
+		auto pParent = parent;
+		while (pParent) {
+			out << " < " << pParent->name;
+			pParent = pParent->parent;
+		}
+		out << std::endl;
+
+		out << std::format("\tnamespace {} {{\n", name);
+
+		if (parent)
+			out << std::format("\t\tusing namespace {};\n\n", parent->name);
+
+		for (auto& field : fields)
+			// ex: constexpr netvar_t m_bIsInAbilityPhase = /* 0x598, bool */ { "client.dll", "CDOTA_BaseAbility", "m_bIsInAbilityPhase" };
+			out << std::format(
+				"\t\tinline netvar_t {} = /* {:#x}, {} */ {{ \"{}\", \"{}\", \"{}\" }};\n",
+				field.m_name,
+				field.m_single_inheritance_offset,
+				field.m_type->m_name_,
+
+				dll,
+				name,
+				field.m_name
+			);
+
+		out << "\t}\n";
+	}
+};
+
+std::unordered_map<std::string, SchemaClass> Netvars;
 
 class CSchemaSystem : public VClass {
 public:
@@ -103,12 +158,14 @@ public:
 		return CallVFunc<13, CSchemaSystemTypeScope*>(m_module_name);
 	}
 
-	CUtlVector<CSchemaSystemTypeScope*> GetTypeScopes() {
+	CUtlVector<CSchemaSystemTypeScope*> GetTypeScopes() const {
 		return Member<CUtlVector<CSchemaSystemTypeScope*>>(0x188);
 	}
+	static CSchemaSystem* GetInstance() {
+		static CSchemaSystem* inst = (CSchemaSystem*)CreateInterface("schemasystem.dll", "SchemaSystem_001");
+		return inst;
+	}
 };
-
-CSchemaSystem* SchemaSystem = 0;
 
 inline void DumpClassMembers(CSchemaClassInfo* classDesc) {
 	std::string className = classDesc->m_name;
@@ -118,19 +175,26 @@ inline void DumpClassMembers(CSchemaClassInfo* classDesc) {
 
 	std::cout << "Dumping " << className << "...\n";
 
-	for (const auto& desc : classDesc->GetFields()) {
-		Netvars[className].insert(desc);
-		//		std::cout << std::format("{}: {} ({})\n", info.schematypeptr->name, info.name, info.offset);
+	SchemaClass schemaClass;
+	for (const auto& field : classDesc->GetFields()) {
+		schemaClass.fields.insert(field);
+	}
+	schemaClass.dll = classDesc->m_type_scope->GetScopeName();
+	schemaClass.name = classDesc->GetName();
+
+	if (classDesc->GetBaseClass()) {
+		DumpClassMembers(*classDesc->GetBaseClass());
+
+		schemaClass.parent = &Netvars[(*classDesc->GetBaseClass())->m_name];
 	}
 
-	if (classDesc->GetBaseClass())
-		DumpClassMembers(*classDesc->GetBaseClass());
+	Netvars[className] = schemaClass;
 }
 
 template<typename... Args>
-void SchemaDumpToMap(const char* _module, Args&&... args) {
+void SchemaDumpToMap(std::string_view _module, Args&&... args) {
 	const char* classes[sizeof...(args)] = { std::forward<Args>(args)... };
-	auto typeScope = SchemaSystem->CallVFunc<13, CSchemaSystemTypeScope*>(_module, nullptr); // second arg is a buffer for something
+	auto typeScope = CSchemaSystem::GetInstance()->CallVFunc<13, CSchemaSystemTypeScope*>(_module.data(), nullptr); // second arg is a buffer for something
 
 	if (!typeScope)
 		return;
@@ -145,15 +209,6 @@ void SchemaDumpToMap(const char* _module, Args&&... args) {
 		DumpClassMembers(classDesc);
 	}
 }
-
-std::string getTimeStr() {
-	std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-
-	std::string s(30, '\0');
-	std::strftime(&s[0], s.size(), "%d-%m-%Y %H:%M:%S", std::localtime(&now));
-	return s;
-}
-
 void DumpClassToText(const CSchemaClassInfo* classDesc, std::ofstream& fout, std::set<std::string>& parents) {
 	fout << std::hex;
 
@@ -171,7 +226,7 @@ void DumpClassToText(const CSchemaClassInfo* classDesc, std::ofstream& fout, std
 
 	if (classDesc->GetBaseClass())
 		fout << " : " << (*classDesc->GetBaseClass())->m_name;
-	fout << '\n';
+	fout << endl;
 
 	if (classDesc->m_fields_size == 0)
 		fout << "<no members>\n";
@@ -180,7 +235,7 @@ void DumpClassToText(const CSchemaClassInfo* classDesc, std::ofstream& fout, std
 			SchemaClassFieldData_t field = classDesc->m_fields[i];
 			fout << std::format("\t{} {} {:#x};\n", field.m_type->m_name_, field.m_name, field.m_single_inheritance_offset);
 		}
-	fout << '\n';
+	fout << endl;
 }
 
 struct InterfaceInfo {
@@ -190,27 +245,26 @@ struct InterfaceInfo {
 };
 
 void DumpAllClasses(const std::string& dir) {
-	auto scopes = SchemaSystem->GetTypeScopes();
-	scopeCount = scopes.m_Size;
+	auto scopes = CSchemaSystem::GetInstance()->GetTypeScopes();
+	scopeCount = scopes.size();
 
-	//for (auto scope : scopes) {
-	//	std::thread([&, scope]() {
+	for (auto scope : scopes) {
+		std::thread([&, scope]() {
+			auto classes = scope->GetClasses();
+			std::filesystem::create_directory(dir + "\\" + scope->GetScopeName().data());
+			auto _cl = classes.GetElements();
+			for (const auto _class : _cl) {
+				std::ofstream fout(dir + "\\" + scope->GetScopeName().data() + "\\" + _class->m_name + ".txt");
 
-	//		auto classes = scope->GetClasses();
-	//		std::filesystem::create_directory(dir + "\\" + scope->GetScopeName().data());
+				const auto classDesc = scope->FindDeclaredClass(_class->m_name);
+				std::set<std::string> parents;
+				DumpClassToText(classDesc, fout, parents);
 
-	//		for (const auto _class : classes.GetElements()) {
-	//			std::ofstream fout(dir + "\\" + scope->GetScopeName().data() + "\\" + _class->m_name + ".txt");
-
-	//			const auto classDesc = scope->FindDeclaredClass(_class->m_name);
-	//			std::set<std::string> parents;
-	//			DumpClassToText(classDesc, fout, parents);
-
-	//			fout.close();
-	//		}
-	//		++scopesDumped;
-	//		}).detach();
-	//}
+				fout.close();
+			}
+			++scopesDumped;
+			}).detach();
+	}
 }
 
 void SaveInterfacesToFile(std::ofstream& fout) {
@@ -250,10 +304,10 @@ void SaveInterfacesToFile(std::ofstream& fout) {
 			pInterface = pInterface->m_pNext;
 		}
 
-		for (auto name : interfaceNames)
-			fout << '\t' << name << '\n';
+		for (auto& name : interfaceNames)
+			fout << '\t' << name << endl;
 
-		fout << '\n';
+		fout << endl;
 		interfaceNames.clear();
 	}
 	std::cout << "Interfaces.txt generated!\n";
@@ -267,35 +321,86 @@ void SaveGameSystemsToFile(std::ofstream& fout) {
 		const char* m_szName;
 	};
 
-	auto m_pFactory = *Memory::Scan("E8 ? ? ? ? 84 C0 74 D3 48 8D 0D", "client.dll")
+	auto m_pFactory = *Memory::Scan("E8 ? ? ? ? 84 C0 74 D3", "client.dll")
 		.GetAbsoluteAddress(1)
-		.Offset(8)
+		.Offset(50)
 		.GetAbsoluteAddress<IGameSystemFactory**>(3);
 
-	set<string> names;
+	set<string> staticFactories, reallocatingFactories;
 
 	while (m_pFactory) {
-		if (m_pFactory->m_szName)
-			names.insert(m_pFactory->m_szName);
+		if (m_pFactory->m_szName) {
+			if (m_pFactory->CallVFunc<9>())
+				staticFactories.insert(m_pFactory->m_szName);
+			else
+				reallocatingFactories.insert(m_pFactory->m_szName);
+		}
 
 		m_pFactory = m_pFactory->m_pNextFactory;
 	}
+	const auto printHeader = [](ostream& out, const std::string& header) {
+		const int width = 20;
+		for (int i = 0; i < width; i++)out << "/";
+		out << endl;
 
-	for (auto name : names)
-		fout << name << '\n';
+		out << "//";
+
+		int spaces = (width - 2 * 2 - header.size()) / 2;
+		for (int i = 0; i < spaces; i++) out << ' ';
+
+		out << header;
+
+		for (int i = 0; i < spaces; i++) out << ' ';
+
+		out << "//" << endl;
+
+		for (int i = 0; i < width; i++)out << "/";
+		out << endl;
+		};
+
+	printHeader(fout, "STATIC");
+	for (auto& name : staticFactories)
+		fout << name << endl;
+
+	fout << endl;
+
+	printHeader(fout, "REALLOCATING");
+	for (auto& name : reallocatingFactories)
+		fout << name << endl;
 
 	std::cout << "GameSystems.txt generated!\n";
 }
 
 void SaveNetvarsToFile(std::ofstream& fout) {
 	fout << std::hex;
-	fout << "#pragma once\n#include <cstdint>\nnamespace Netvars {\n";
-	for (auto& [className, classMap] : Netvars) {
-		fout << std::format("\tnamespace {}", className) << " {\n";
-		for (auto& desc : classMap)
-			fout << std::format("\t\tconstexpr uint32_t {} = {:#x}; // {}\n", desc.m_name, desc.m_single_inheritance_offset, desc.m_type->m_name_);
+	fout
+		<< "#pragma once\n"
+		<< "#include <cstdint>\n"
+		<< "#include <optional>\n"
+		<< "\n// Generated at " << getTimeStr() << "\n"
+		<< "// D2C Netvars: existence checked at compile time, offset lazily evaluated\n"
+		<< "\n" R"(class netvar_t {
+	std::string_view dll, name, member;
 
-		fout << "\t}\n";
+	std::optional<uint16_t> offset;
+public:
+	constexpr netvar_t(std::string_view dll, std::string_view name, std::string_view member)
+		: dll(dll), name(name), member(member)
+	{}
+
+	uint16_t GetOffset();
+
+	operator uint16_t() {
+		return GetOffset();
+	}
+};)"
+"\n"
+<< "\nnamespace Netvars {\n";
+
+
+	std::set<SchemaClass*> alreadyDumped;
+	for (auto& [className, schemaClass] : Netvars) {
+		schemaClass.DumpToStream(fout, alreadyDumped);
 	}
 	fout << "}";
 
@@ -303,7 +408,7 @@ void SaveNetvarsToFile(std::ofstream& fout) {
 }
 
 
-void HackThread(HMODULE hModule) {
+static void HackThread(HMODULE hModule) {
 	const bool console = true;
 
 	FILE* f;
@@ -323,15 +428,18 @@ void HackThread(HMODULE hModule) {
 	std::filesystem::remove_all(dumpFolderPath);
 	std::filesystem::create_directory(dumpFolderPath);
 
-	SchemaSystem = (CSchemaSystem*)CreateInterface("schemasystem.dll", "SchemaSystem_001");
-	std::cout << "SchemaSystem: " << SchemaSystem << '\n';
+	std::cout << "SchemaSystem: " << CSchemaSystem::GetInstance() << endl;
 
 	std::cout << "Dump started at " << getTimeStr() << std::endl << std::endl;
 
 	clock_t timeStart = clock();
 
-	// TODO: paste implementation from source2sdk
-	// DumpAllClasses(dumpFolderPath);
+	DumpAllClasses(dumpFolderPath);
+
+	auto scopes = CSchemaSystem::GetInstance()->GetTypeScopes();
+	for (auto scope : scopes) {
+		std::cout << scope->GetScopeName() << std::endl;
+	}
 
 	SchemaDumpToMap("client.dll",
 		"CEntityIdentity",
@@ -387,7 +495,7 @@ void HackThread(HMODULE hModule) {
 
 	clock_t timeEnd = clock();
 
-	std::cout << "\nTime elapsed: " << round(((double)(timeEnd - timeStart) / CLOCKS_PER_SEC) * 10) / 10 << "s" << '\n';
+	std::cout << "\nTime elapsed: " << round(((double)(timeEnd - timeStart) / CLOCKS_PER_SEC) * 10) / 10 << "s" << endl;
 
 	if (console) {
 		system("pause");
